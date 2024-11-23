@@ -1,0 +1,112 @@
+name: kubeproj action
+on: workflow_dispatch
+env:
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: kubeproj24440
+  EKS_CLUSTER: kubeproj-eks24
+
+jobs:
+  Testing: 
+    runs-on: ubuntu-latest
+    steps: 
+      - name: Code checkout
+        uses: actions/checkout@v4
+
+      - name: Set Java 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+      
+      - name: Maven test
+        run: mvn test
+      
+      - name: Checkstyle
+        run: mvn checkstyle:checkstyle
+      
+      - name: Setup SonarQube Scanner
+        uses: warchant/setup-sonar-scanner@v7
+      
+      - name: Run SonarQube Scanner with Debug
+        run: |
+          sonar-scanner -X \
+            -Dsonar.host.url=${{ secrets.SONAR_URL }} \
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }} \
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }} \
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }} \
+            -Dsonar.sources=src/ \
+            -Dsonar.jacoco.reportsPath=target/jacoco.exec \
+            -Dsonar.junit.reportsPath=target/surefire-reports/ \
+            -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml \
+            -Dsonar.java.binaries=target/test-classes/com/visualpathit/account/controllerTest/
+      
+      - name: SonarQube Quality Gate check
+        id: sonarqube-quality-gate-check
+        uses: sonarsource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_URL: ${{ secrets.SONAR_URL }}
+
+  BUILD_AND_PUBLISH: 
+    needs: Testing
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Code checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Amazon ECR
+        run: aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.REGISTRY }}
+
+      - name: Build and upload image to ECR
+        uses: appleboy/docker-ecr-action@master
+        with:
+          access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          registry: ${{ secrets.REGISTRY }}
+          repo: ${{ env.ECR_REPOSITORY }}
+          region: ${{ env.AWS_REGION }}
+          tags: latest,${{ github.run_number }}
+          dockerfile: ./Dockerfile
+          context: ./
+      
+      - name: Configure kubectl
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER }}
+
+      #- name: Create Kubernetes Secret for ECR
+      #  run: |
+      #    kubectl create secret docker-registry regcred \
+      #      --docker-server=${{ secrets.REGISTRY }} \
+      #      --docker-username=AWS \
+      #      --docker-password=$(aws ecr get-login-password --region ${{ env.AWS_REGION }}) \
+      #      --docker-email=your-email@example.com
+      - name: Create or Update Kubernetes Secret for ECR
+        run: |
+          if kubectl get secret regcred --namespace default; then
+             echo "Secret 'regcred' already exists. Updating it."
+             kubectl delete secret regcred --namespace default
+          fi
+          kubectl create secret docker-registry regcred \
+             --docker-server=${{ secrets.REGISTRY }} \
+             --docker-username=AWS \
+             --docker-password=$(aws ecr get-login-password --region ${{ env.AWS_REGION }}) \
+             --docker-email=your-email@example.com
+
+      - name: Deploy Helm
+        uses: bitovi/github-actions-deploy-eks-helm@v1.2.10
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          cluster-name: ${{ env.EKS_CLUSTER }}
+          chart-path: helm/kubecharts
+          namespace: default
+          values: appimage=${{ secrets.REGISTRY }}/${{ env.ECR_REPOSITORY }},apptag=${{ github.run_number }}
+          name: vprofile-stack
